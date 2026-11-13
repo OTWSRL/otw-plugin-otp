@@ -77,7 +77,7 @@ declare module '@otwdesign/sdk' {
     'otp.method_sms': boolean
     /** Minutes a sent code works for. */
     'otp.code_minutes': string
-    /** Codes the site's forms may send visitors in an hour, per channel. */
+    /** Codes the site's forms and setups may send in an hour, per channel. */
     'otp.hourly_limit': string
     /** Which SMS provider sends text messages: `auto`, `twilio`, `http`. */
     'otp.sms_provider': string
@@ -270,7 +270,7 @@ export default definePlugin({
       type: 'text',
       label: 'Codes forms may send an hour',
       description:
-        'The most codes the site’s forms send visitors in an hour, by email and by text message each: a ceiling on what a flood of requests can cost. Signing in doesn’t count.',
+        'The most codes the site’s forms, and people setting up a way, are sent in an hour, by email and by text message each: a ceiling on what a flood of requests can cost. Signing in doesn’t count.',
       default: '100',
       maxLength: 6,
       validate: (value) => (/^\d+$/.test(value) ? null : 'Use a whole number'),

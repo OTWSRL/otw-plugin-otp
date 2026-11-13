@@ -8,7 +8,7 @@ import {
   type SignInMethod,
   type User,
 } from '@otwdesign/sdk'
-import { and, count, desc, eq, gt, isNotNull, isNull, lt, or, sql } from 'drizzle-orm'
+import { and, count, desc, eq, gt, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm'
 import { maskAddress, normalizeAddress, type OtpChannel } from './channels'
 import { backupCodes, challenges, devices, methods } from './schema'
 import { backupCode, cleanBackupCode, numericCode, sameHash, type Keys } from './secrets'
@@ -29,6 +29,8 @@ export const MAX_ATTEMPTS = 5
 export const RESEND_SECONDS = 60
 /** Codes one address may be sent in an hour. */
 export const MAX_PER_HOUR = 5
+/** Codes one person may be sent in an hour, wherever they go: setting up number after number. */
+export const MAX_PER_PERSON = 10
 /** How long a code a form checked stays good for the form's own submit, in minutes. */
 export const PROOF_MINUTES = 30
 /** How long new backup codes stay on the screen that shows them once, in seconds. */
@@ -50,7 +52,7 @@ export interface Policy {
   rememberDays: number
   /** Minutes a sent code works for. */
   minutes: number
-  /** Codes visitors' forms may have sent in an hour, per channel. */
+  /** Codes forms and setups may have sent in an hour, per channel. Signing in doesn't count. */
   hourlyLimit: number
 }
 
@@ -196,9 +198,9 @@ export function createEngine(options: EngineOptions) {
   // ── Codes that are sent ──────────────────────────────────────────────────────
 
   /**
-   * Sends a new code to an address, within its limits: one a minute and five an hour, and for
-   * visitors' forms the channel's hourly limit, so a form can't be used to flood an inbox or
-   * run up the SMS bill.
+   * Sends a new code to an address, within its limits: one a minute and five an hour to the
+   * address, ten an hour to a person, and the channel's hourly limit for everything but
+   * signing in, so neither a form nor an account can flood an inbox or run up the SMS bill.
    */
   const issue = async (input: {
     channel: OtpChannel
@@ -223,19 +225,30 @@ export function createEngine(options: EngineOptions) {
     if ((recent?.hour ?? 0) >= MAX_PER_HOUR) {
       throw new ActionError('Too many codes were sent there. Try again in an hour.')
     }
-    if (input.userId === null) {
+    if (input.userId !== null) {
+      const [own] = await db()
+        .select({ sent: count() })
+        .from(challenges)
+        .where(and(eq(challenges.userId, input.userId), gt(challenges.createdAt, ago(HOUR_MS))))
+      if ((own?.sent ?? 0) >= MAX_PER_PERSON) {
+        throw new ActionError('Too many codes were sent. Try again in an hour.')
+      }
+    }
+    // A sign-in's code goes to an address its owner confirmed. Anything else can name any
+    // address, a form's or a setup's, so the site as a whole sends only so many an hour.
+    if (input.purpose !== SIGN_IN) {
       const [all] = await db()
         .select({ sent: count() })
         .from(challenges)
         .where(
           and(
             eq(challenges.channel, input.channel.id),
-            isNull(challenges.userId),
+            ne(challenges.purpose, SIGN_IN),
             gt(challenges.createdAt, ago(HOUR_MS)),
           ),
         )
       if ((all?.sent ?? 0) >= policy.hourlyLimit) {
-        logger.warn('OTP: the hourly limit for codes sent by forms was reached', {
+        logger.warn('OTP: the hourly limit for codes sent by forms and setups was reached', {
           channel: input.channel.id,
           limit: policy.hourlyLimit,
         })

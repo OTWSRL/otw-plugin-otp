@@ -206,8 +206,9 @@ From server code, the same service sends and checks without the field:
 - **A password reset doesn't bypass it.** After setting a password from an emailed link, a
   person with an app or a phone is still asked for its code. One whose only way is email is not:
   the link has just proved the same inbox.
-- **A form's codes are limited** per address and, for the whole site, per hour, so a form can't
-  be used to flood an inbox or run up the SMS bill.
+- **What can be sent is limited**: one code a minute and five an hour to an address, ten an hour
+  to a person, and for the whole site an hourly ceiling on codes for forms and for setting a way
+  up. So neither a form nor an account can be used to flood an inbox or run up the SMS bill.
 
 ## Locked out
 

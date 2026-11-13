@@ -379,6 +379,34 @@ describe('codes by text message', () => {
     expect(site.texts.map((text) => text.to)).toEqual([PHONE, PHONE])
   })
 
+  it('can’t be used by one account to text number after number', async () => {
+    const site = await bootOtp({ sms: true })
+    const cleo = await site.person('cleo@cms.test', 'customer')
+    const start = (index: number) =>
+      site.act(cleo.cookie, 'start-channel', { channel: 'sms', to: `+3933312345${10 + index}` })
+    for (let index = 0; index < 10; index++) expect((await start(index)).flash?.kind).toBe('notice')
+    expect((await start(10)).flash).toEqual({
+      kind: 'error',
+      message: 'Too many codes were sent. Try again in an hour.',
+    })
+    expect(site.texts).toHaveLength(10)
+    site.wait(60 * 60 + 1)
+    expect((await start(11)).flash?.kind).toBe('notice')
+  })
+
+  it('count against the site’s hourly ceiling while being set up, whoever asks', async () => {
+    const site = await bootOtp({ sms: true, settings: { 'otp.hourly_limit': '2' } })
+    for (const [index, name] of ['ann', 'ben', 'cy'].entries()) {
+      const person = await site.person(`${name}@cms.test`, 'customer')
+      const started = await site.act(person.cookie, 'start-channel', {
+        channel: 'sms',
+        to: `+3933312345${10 + index}`,
+      })
+      expect(started.flash?.kind).toBe(index < 2 ? 'notice' : 'error')
+    }
+    expect(site.texts).toHaveLength(2)
+  })
+
   it('leave nothing half set up when the first text can’t be sent', async () => {
     const site = await bootOtp({ sms: true })
     const ada = await site.person('ada@cms.test')
