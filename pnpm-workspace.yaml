@@ -1,0 +1,9 @@
+# The plugin is the root package; site/ is the OTW site it's developed and tested on. The root is
+# listed too, so Changesets, which only counts listed packages, sees the plugin it releases.
+packages:
+  - .
+  - site
+
+onlyBuiltDependencies:
+  - esbuild
+  - sharp

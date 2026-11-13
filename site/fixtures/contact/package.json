@@ -1,0 +1,10 @@
+{
+  "name": "contact-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A plugin for the e2e tests: a contact form that checks the sender's email address with a code. Its imports resolve from the site.",
+  "type": "module",
+  "exports": {
+    ".": "./index.tsx"
+  }
+}
