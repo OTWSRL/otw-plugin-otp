@@ -97,6 +97,7 @@ declare module '@otwdesign/sdk' {
     'otp.sms_http_token': string
   }
   interface Services {
+    /** One-time codes for any form, and what a person's two-step sign-in is set to. */
     otp: OtpService
   }
   interface Registries {
