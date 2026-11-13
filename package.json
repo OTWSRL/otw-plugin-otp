@@ -1,6 +1,6 @@
 {
   "name": "@otwdesign/plugin-otp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Two-step sign-in and one-time codes for OTW CMS: an authenticator app, email, SMS (Twilio or your own service) or WhatsApp, for signing in and for any form.",
   "license": "Apache-2.0",
   "author": "OTW SRL",

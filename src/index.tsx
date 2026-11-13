@@ -238,7 +238,7 @@ export function internalsOf(service: OtpService): Internals {
 
 export default definePlugin({
   id: 'otp',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'OTP',
   description:
     'Two-step sign-in with an authenticator app, email or text message, and one-time codes for any form.',
