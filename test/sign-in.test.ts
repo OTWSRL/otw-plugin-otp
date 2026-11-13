@@ -259,7 +259,7 @@ describe('codes by email', () => {
   })
 
   it('stop working when they run out, and after five wrong tries', async () => {
-    const site = await bootOtp({ settings: { 'otp.required_roles': 'administrator' } })
+    const site = await bootOtp({ settings: { 'otp.required_roles': ['administrator'] } })
     await site.person('ada@cms.test')
     const held = await site.logIn('ada@cms.test')
     const code = emailedCode(site.inbox, 'ada@cms.test')
@@ -275,7 +275,7 @@ describe('codes by email', () => {
   })
 
   it('aren’t sent more than once a minute, or five times an hour', async () => {
-    const site = await bootOtp({ settings: { 'otp.required_roles': 'administrator' } })
+    const site = await bootOtp({ settings: { 'otp.required_roles': ['administrator'] } })
     await site.person('ada@cms.test')
     const held = await site.logIn('ada@cms.test')
     const cookie = `cms_sign_in=${held.hold}`
@@ -304,7 +304,7 @@ describe('codes by email', () => {
   })
 
   it('say so when the email can’t be sent, and don’t count what wasn’t', async () => {
-    const site = await bootOtp({ settings: { 'otp.required_roles': 'administrator' } })
+    const site = await bootOtp({ settings: { 'otp.required_roles': ['administrator'] } })
     await site.person('ada@cms.test')
     site.failing.mail = true
     const held = await site.logIn('ada@cms.test')

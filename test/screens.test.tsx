@@ -90,7 +90,7 @@ describe('the two-step sign-in section', () => {
   })
 
   it('tells someone whose role must use a code where their codes go', async () => {
-    const site = await bootOtp({ settings: { 'otp.required_roles': 'administrator' } })
+    const site = await bootOtp({ settings: { 'otp.required_roles': ['administrator'] } })
     const ada = await site.person('ada@cms.test')
     const page = html(
       <TwoStepSection
@@ -159,11 +159,11 @@ describe('the admin’s screens', () => {
     expect(status).toContain('Turned off in Settings')
     expect(status).toContain('Stored as they are: a copy of the database could make codes')
     expect(status).toContain('OTP_DISABLED=true')
-    expect(status).not.toContain('Send a test message')
+    expect(status).not.toContain('Send a test by')
 
     const full = await bootOtp({
       sms: true,
-      settings: { 'otp.required_roles': 'administrator' },
+      settings: { 'otp.required_roles': ['administrator'] },
       env: { OTP_SECRET_KEY: 'a key of at least thirty-two characters' },
     })
     await full.withApp(await full.person('ada@cms.test'))
@@ -172,7 +172,9 @@ describe('the admin’s screens', () => {
     expect(ready).toContain('administrator')
     expect(ready).toContain('Ready, through Carrier')
     expect(ready).toContain('Encrypted with OTP_SECRET_KEY')
-    expect(ready).toContain('Send a test message')
+    expect(ready).toContain('Send a test by Text message')
+    // WhatsApp is off, so it has no test.
+    expect(ready).not.toContain('Send a test by WhatsApp')
   })
 
   it('warn while everyone is let in, and about a key too short to use', async () => {
@@ -196,12 +198,14 @@ describe('the admin’s screens', () => {
       'Who is asked for a code',
       'Ways to get a code',
       'Text messages',
+      'WhatsApp',
+      'Twilio account',
       'Codes for forms',
     ])
   })
 
   it('show whoever manages users someone’s two-step sign-in, with a reset once there is one', async () => {
-    const site = await bootOtp({ settings: { 'otp.required_roles': 'editor' } })
+    const site = await bootOtp({ settings: { 'otp.required_roles': ['editor'] } })
     const ada = await site.person('ada@cms.test')
     const bob = await site.person('bob@cms.test', 'editor')
     const [Section] = site.kernel.slot('admin.user')
@@ -243,5 +247,113 @@ describe('the admin’s screens', () => {
     expect(listWays(['an authenticator app', 'text message', 'email'])).toBe(
       'an authenticator app, text message and email',
     )
+  })
+})
+
+describe('the settings page', () => {
+  const settings = async (site: Awaited<ReturnType<typeof bootOtp>>) => {
+    const { user } = await site.signIn()
+    const page = await site.kernel.resolveAdminPage('/admin/otp/settings', {}, user)
+    if (page.kind !== 'settings') throw new Error(`Expected settings, got ${page.kind}`)
+    return page.view
+  }
+  const field = (view: Awaited<ReturnType<typeof settings>>, key: string) =>
+    view.sections.flatMap((section) => section.fields).find((candidate) => candidate.key === key)!
+
+  it('offers the site’s roles as checkboxes', async () => {
+    const view = await settings(await bootOtp())
+    const roles = field(view, 'otp.required_roles')
+    expect(roles).toMatchObject({ type: 'roles', value: [] })
+    expect(roles.options!.map((role) => role.value)).toEqual(
+      expect.arrayContaining(['administrator', 'editor', 'author', 'contributor', 'customer']),
+    )
+  })
+
+  it('shows each provider’s fields only once that provider is chosen', async () => {
+    const view = await settings(await bootOtp())
+    const when = (key: string) => field(view, key).visibility?.groups
+    expect(when('otp.sms_provider')).toBeUndefined()
+    expect(when('otp.twilio_from')).toEqual([[{ setting: 'otp.sms_provider', is: 'twilio' }]])
+    expect(when('otp.sms_http_url')).toEqual([[{ setting: 'otp.sms_provider', is: 'http' }]])
+    expect(when('otp.sms_http_headers')).toEqual([
+      [
+        { setting: 'otp.sms_provider', is: 'http' },
+        { setting: 'otp.sms_http_auth', is: 'headers' },
+      ],
+    ])
+    expect(when('otp.sms_http_token')).toEqual([
+      [
+        { setting: 'otp.sms_provider', is: 'http' },
+        { setting: 'otp.sms_http_auth', is: 'bearer' },
+      ],
+    ])
+    expect(when('otp.sms_http_template')).toEqual([
+      [
+        { setting: 'otp.sms_provider', is: 'http' },
+        { setting: 'otp.sms_http_body', is: 'template' },
+      ],
+    ])
+    expect(when('otp.whatsapp_phone_id')).toEqual([
+      [{ setting: 'otp.whatsapp_provider', is: 'meta' }],
+    ])
+    expect(when('otp.twilio_whatsapp_from')).toEqual([
+      [{ setting: 'otp.whatsapp_provider', is: 'twilio' }],
+    ])
+  })
+
+  it('shows a channel’s section only while that channel is on, and Twilio’s account for either', async () => {
+    const view = await settings(await bootOtp())
+    const section = (title: string) => view.sections.find((candidate) => candidate.title === title)!
+    expect(section('Text messages')).toMatchObject({
+      visibility: { groups: [[{ setting: 'otp.method_sms', is: true }]], shown: false },
+      link: { label: 'Send a Test Message', url: '/admin/otp#test-sms' },
+    })
+    expect(section('WhatsApp').visibility).toEqual({
+      groups: [[{ setting: 'otp.method_whatsapp', is: true }]],
+      shown: false,
+    })
+    expect(section('Twilio account').visibility).toEqual({
+      groups: [
+        [
+          { setting: 'otp.method_sms', is: true },
+          { setting: 'otp.sms_provider', is: 'twilio' },
+        ],
+        [
+          { setting: 'otp.method_whatsapp', is: true },
+          { setting: 'otp.whatsapp_provider', is: 'twilio' },
+        ],
+      ],
+      shown: false,
+    })
+    // With text messages on and Twilio chosen, as it is by default, the account shows.
+    const on = await settings(await bootOtp({ settings: { 'otp.method_sms': true } }))
+    expect(
+      on.sections.find((candidate) => candidate.title === 'Twilio account')!.visibility!.shown,
+    ).toBe(true)
+  })
+
+  it('warns about nothing: every condition names a setting that is a choice', async () => {
+    const site = await bootOtp()
+    expect(site.logger.entries.filter((entry) => entry.message.includes('shows when'))).toEqual([])
+  })
+
+  it('refuses headers that aren’t headers when the page is saved', async () => {
+    const site = await bootOtp()
+    const { cookie } = await site.signIn()
+    const response = await site.request('POST', '/api/p/core/actions/save-settings', {
+      body: new URLSearchParams([
+        ['page', 'otp.settings'],
+        ['otp.method_app', 'on'],
+        ['otp.sms_http_headers.name', 'Host'],
+        ['otp.sms_http_headers.value', 'evil.example.com'],
+      ]).toString(),
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      cookie,
+    })
+    const url = new URL(response.headers.get('location')!, 'http://cms.test')
+    expect(site.kernel.readFlash(url.searchParams.get('flash') ?? undefined)).toEqual({
+      kind: 'error',
+      message: 'Headers: Host is set by the request itself.',
+    })
   })
 })

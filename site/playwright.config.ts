@@ -4,6 +4,7 @@ const PORT = 3495
 /** The stand-in SMS service the plugin's HTTP provider posts to (e2e/fake-sms.mjs). */
 const SMS_PORT = 3496
 const SMS_TOKEN = 'e2e-sms-token'
+const WHATSAPP_TOKEN = 'e2e-whatsapp-token'
 
 export default defineConfig({
   testDir: './e2e',
@@ -25,6 +26,7 @@ export default defineConfig({
         FAKE_SMS_PORT: String(SMS_PORT),
         FAKE_SMS_DIR: '.data/e2e-sms',
         OTP_SMS_TOKEN: SMS_TOKEN,
+        WHATSAPP_TOKEN,
       },
     },
     {
@@ -40,6 +42,9 @@ export default defineConfig({
         // Text messages go to the stand-in service; its secret comes from the environment.
         OTP_SMS_URL: `http://127.0.0.1:${SMS_PORT}/sms`,
         OTP_SMS_TOKEN: SMS_TOKEN,
+        // WhatsApp's Cloud API is the same stand-in, at the address the Graph API would be.
+        WHATSAPP_API_URL: `http://127.0.0.1:${SMS_PORT}`,
+        WHATSAPP_TOKEN,
         OTP_SECRET_KEY: 'an e2e key of at least thirty-two characters',
       },
     },

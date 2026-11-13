@@ -1,7 +1,7 @@
 {
   "name": "@otwdesign/plugin-otp",
   "version": "1.0.0",
-  "description": "Two-step sign-in and one-time codes for OTW CMS: an authenticator app, email or SMS (Twilio or your own service), for signing in and for any form.",
+  "description": "Two-step sign-in and one-time codes for OTW CMS: an authenticator app, email, SMS (Twilio or your own service) or WhatsApp, for signing in and for any form.",
   "license": "Apache-2.0",
   "author": "OTW SRL",
   "repository": {
@@ -24,7 +24,8 @@
     "authenticator",
     "sms",
     "twilio",
-    "one-time-password"
+    "one-time-password",
+    "whatsapp"
   ],
   "type": "module",
   "packageManager": "pnpm@10.5.2",
@@ -61,8 +62,8 @@
     "uqr": "^0.1.3"
   },
   "peerDependencies": {
-    "@otwdesign/admin-ui": "^1.7.0",
-    "@otwdesign/sdk": "^1.7.0",
+    "@otwdesign/admin-ui": "^1.8.0",
+    "@otwdesign/sdk": "^1.8.0",
     "drizzle-orm": ">=0.45.0",
     "react": "^19.0.0"
   },

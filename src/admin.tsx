@@ -1,6 +1,5 @@
 import { FormButton, FormField, FormTable, Notice } from '@otwdesign/admin-ui'
 import { ActionError, defineAdmin, type User } from '@otwdesign/sdk'
-import { messageText } from './channels'
 import { APP } from './engine'
 import otp, { internalsOf } from './index'
 import { normalizePhone } from './addresses'
@@ -8,6 +7,8 @@ import { KEY_ENV } from './secrets'
 import { TwoStepSection } from './section'
 
 const MANAGE = 'otp.manage'
+const SMS_ON = { setting: 'otp.method_sms', is: true } as const
+const WHATSAPP_ON = { setting: 'otp.method_whatsapp', is: true } as const
 /** Every role has it: anyone signed in may set up their own two-step sign-in. */
 const OWN = 'core.read'
 
@@ -28,7 +29,7 @@ export function listWays(labels: readonly string[]): string {
  */
 export default defineAdmin(otp, (cms) => {
   const service = cms.services.get('otp')
-  const { engine, policy, smsProvider, key } = internalsOf(service)
+  const { engine, policy, smsProvider, whatsAppProvider, key } = internalsOf(service)
   /** A way as a sentence names it: "an authenticator app", "email", "text message". */
   const label = (method: string) =>
     method === APP
@@ -158,10 +159,13 @@ export default defineAdmin(otp, (cms) => {
       stats: await engine.stats(),
       channels: service.channels(),
       policy: policy(),
-      provider: smsProvider()?.label ?? null,
-      smsOn: policy().allowed('sms'),
+      // Which provider each channel's messages go through now, by channel.
+      providers: {
+        sms: smsProvider()?.label ?? null,
+        whatsapp: whatsAppProvider()?.label ?? null,
+      } as Record<string, string | null>,
     }),
-    component: ({ data: { stats, channels, policy: rules, provider, smsOn } }) => {
+    component: ({ data: { stats, channels, policy: rules, providers } }) => {
       const roles = [...rules.requiredRoles]
       return (
         <>
@@ -204,14 +208,14 @@ export default defineAdmin(otp, (cms) => {
             {channels.map((way) => (
               <FormField key={way.id} label={way.label}>
                 {way.ready
-                  ? way.id === 'sms' && provider
-                    ? `Ready, through ${provider}`
+                  ? providers[way.id]
+                    ? `Ready, through ${providers[way.id]}`
                     : 'Ready'
                   : !rules.allowed(way.id)
                     ? 'Turned off in Settings'
                     : way.kind === 'email'
                       ? 'Needs a mail plugin, such as Mailer, to send email'
-                      : 'Needs an SMS provider: set one up in Settings'}
+                      : 'Its provider isn’t fully set up: finish it in Settings'}
               </FormField>
             ))}
             <FormField
@@ -228,35 +232,38 @@ export default defineAdmin(otp, (cms) => {
             </FormField>
           </FormTable>
 
-          {smsOn && (
-            <>
-              <h2>Send a test message</h2>
-              <form method="post" action={cms.admin.actionUrl('test-sms')}>
-                <FormTable>
-                  <FormField
-                    label="Mobile number"
-                    htmlFor="otp-test-to"
-                    description="With its country code. It’s sent a short message through your SMS provider."
-                  >
-                    <input
-                      id="otp-test-to"
-                      name="to"
-                      type="tel"
-                      className="regular-text"
-                      autoComplete="tel"
-                      placeholder="+39 333 123 4567"
-                      required
-                    />
-                  </FormField>
-                </FormTable>
-                <p className="submit">
-                  <button type="submit" className="button">
-                    Send Test Message
-                  </button>
-                </p>
-              </form>
-            </>
-          )}
+          {channels
+            .filter((way) => way.kind === 'phone' && rules.allowed(way.id))
+            .map((way) => (
+              <section key={way.id} id={`test-${way.id}`}>
+                <h2>Send a test by {way.label}</h2>
+                <form method="post" action={cms.admin.actionUrl('test-message')}>
+                  <input type="hidden" name="channel" value={way.id} />
+                  <FormTable>
+                    <FormField
+                      label="Mobile number"
+                      htmlFor={`otp-test-${way.id}`}
+                      description={`With its country code. It’s sent the code 123456 through your ${way.label} provider.`}
+                    >
+                      <input
+                        id={`otp-test-${way.id}`}
+                        name="to"
+                        type="tel"
+                        className="regular-text"
+                        autoComplete="tel"
+                        placeholder="+39 333 123 4567"
+                        required
+                      />
+                    </FormField>
+                  </FormTable>
+                  <p className="submit">
+                    <button type="submit" className="button">
+                      Send Test by {way.label}
+                    </button>
+                  </p>
+                </form>
+              </section>
+            ))}
 
           <h2>Locked out?</h2>
           <p>
@@ -270,28 +277,33 @@ export default defineAdmin(otp, (cms) => {
   })
 
   cms.admin.action({
-    name: 'test-sms',
+    name: 'test-message',
     capability: MANAGE,
     handler: async ({ form }) => {
+      const way = cms.registries
+        .get('otp.channels')
+        .list()
+        .find((channel) => channel.id === field(form, 'channel') && channel.kind === 'phone')
+      if (!way || !policy().allowed(way.id)) throw new ActionError('That way isn’t turned on.')
       const to = normalizePhone(field(form, 'to'))
       if (!to) {
         throw new ActionError('Enter the number with its country code, such as +39 333 123 4567.')
       }
-      const provider = smsProvider()
-      if (!provider) throw new ActionError('No SMS provider is set up. Add one in Settings.')
-      const site = cms.settings.get('site.title') || 'My Site'
-      const text = messageText({ code: '123456', minutes: 10, site, purpose: 'test' })
-      try {
-        await provider.send({ to, text: `Test: ${text}` })
-      } catch (error) {
-        cms.logger.error('OTP: the test message could not be sent', {
-          provider: provider.id,
-          error,
-        })
-        const why = error instanceof Error ? error.message : 'see the server log'
-        throw new ActionError(`${provider.label} couldn’t send it: ${why}`)
+      if (!way.ready()) {
+        throw new ActionError(
+          `${way.label} has no provider that is fully set up. Finish it in Settings.`,
+        )
       }
-      return { notice: `${provider.label} accepted a test message for ${to}.` }
+      const site = cms.settings.get('site.title') || 'My Site'
+      try {
+        await way.send(to, { code: '123456', minutes: 10, site, purpose: 'test' })
+      } catch (error) {
+        // The provider's own words: which setting is missing, or what the service answered.
+        cms.logger.error('OTP: the test message could not be sent', { channel: way.id, error })
+        const why = error instanceof Error ? error.message : 'see the server log'
+        throw new ActionError(`The ${way.label} test couldn’t be sent: ${why}`)
+      }
+      return { notice: `A ${way.label} test was accepted for ${to}.` }
     },
   })
 
@@ -314,32 +326,78 @@ export default defineAdmin(otp, (cms) => {
     title: 'Ways to get a code',
     description: 'What people can set up for themselves, on their Profile and their account page.',
     order: 20,
-    fields: ['otp.method_app', 'otp.method_email', 'otp.method_sms', 'otp.code_minutes'],
+    fields: [
+      'otp.method_app',
+      'otp.method_email',
+      'otp.method_sms',
+      'otp.method_whatsapp',
+      'otp.code_minutes',
+    ],
   })
   cms.admin.settingsSection({
     name: 'sms',
     page: 'otp.settings',
     title: 'Text messages',
-    description:
-      'Twilio, or any service that takes an HTTP request. Secrets come from the server’s environment.',
     order: 30,
     fields: [
       'otp.sms_provider',
+      'otp.twilio_from',
+      'otp.sms_http_url',
+      'otp.sms_http_method',
+      'otp.sms_http_auth',
+      'otp.sms_http_token',
+      'otp.sms_http_headers',
+      'otp.sms_http_body',
+      'otp.sms_http_template',
+      'otp.sms_http_content_type',
+    ],
+    showWhen: SMS_ON,
+    link: { label: 'Send a Test Message', url: `${cms.admin.url('/')}#test-sms` },
+  })
+  cms.admin.settingsSection({
+    name: 'whatsapp',
+    page: 'otp.settings',
+    title: 'WhatsApp',
+    order: 40,
+    fields: [
+      'otp.whatsapp_provider',
+      'otp.whatsapp_phone_id',
+      'otp.whatsapp_token',
+      'otp.whatsapp_template',
+      'otp.whatsapp_language',
+      'otp.twilio_whatsapp_from',
+      'otp.twilio_whatsapp_template',
+    ],
+    showWhen: WHATSAPP_ON,
+    link: { label: 'Send a Test by WhatsApp', url: `${cms.admin.url('/')}#test-whatsapp` },
+  })
+  cms.admin.settingsSection({
+    name: 'twilio',
+    page: 'otp.settings',
+    title: 'Twilio account',
+    description:
+      'One account for text messages and WhatsApp alike. Its secrets come from the server’s environment.',
+    order: 50,
+    fields: [
       'otp.twilio_account_sid',
       'otp.twilio_auth_token',
       'otp.twilio_api_key',
       'otp.twilio_api_secret',
-      'otp.twilio_from',
-      'otp.sms_http_url',
-      'otp.sms_http_token',
     ],
+    // Whichever of the two is on and goes through Twilio.
+    showWhen: {
+      any: [
+        [SMS_ON, { setting: 'otp.sms_provider', is: 'twilio' }],
+        [WHATSAPP_ON, { setting: 'otp.whatsapp_provider', is: 'twilio' }],
+      ],
+    },
   })
   cms.admin.settingsSection({
     name: 'forms',
     page: 'otp.settings',
     title: 'Codes for forms',
     description: 'For the site’s own forms that check an email address or a phone number.',
-    order: 40,
+    order: 60,
     fields: ['otp.hourly_limit'],
   })
 })

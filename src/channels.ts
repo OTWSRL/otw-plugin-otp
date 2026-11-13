@@ -41,6 +41,21 @@ export interface SmsProvider {
   send(message: { to: string; text: string }): Promise<void>
 }
 
+/**
+ * A service that delivers a code over WhatsApp: Meta's Cloud API, Twilio, or one a plugin adds.
+ * It's given the code, not a text: WhatsApp sends a business's approved template, filled in.
+ */
+export interface WhatsAppProvider {
+  /** Such as `meta`. */
+  id: string
+  /** What the status page calls it. */
+  label: string
+  /** Whether its keys and its template are set. */
+  ready(): boolean
+  /** Delivers `code` to `to`, a number in E.164 (`+393331234567`), or throws with a reason. */
+  send(message: { to: string; code: string }): Promise<void>
+}
+
 /** An address as its kind of channel keeps and compares it, or `null` when it isn't one. */
 export function normalizeAddress(kind: OtpChannel['kind'], address: string): string | null {
   return kind === 'email' ? normalizeEmail(address) : normalizePhone(address)
@@ -99,20 +114,36 @@ export function smsChannel(provider: () => SmsProvider | null): OtpChannel {
   }
 }
 
+/** Codes over WhatsApp, through whichever WhatsApp provider the site uses. */
+export function whatsAppChannel(provider: () => WhatsAppProvider | null): OtpChannel {
+  return {
+    id: 'whatsapp',
+    label: 'WhatsApp',
+    kind: 'phone',
+    ready: () => provider() !== null,
+    async send(to, message) {
+      const active = provider()
+      if (!active) throw new Error('No WhatsApp provider is set up')
+      await active.send({ to, code: message.code })
+    },
+  }
+}
+
+/** What Settings calls "a provider another plugin adds". */
+export const PLUGIN_PROVIDER = 'plugin'
+
 /**
- * The provider text messages go through: the one Settings names, when it's ready; left on
- * automatic, one a plugin added, before Twilio and the HTTP gateway, whichever is ready first.
+ * The provider messages go through: the one Settings names, when it's ready. `plugin` is the
+ * first ready one that another plugin added.
  */
-export function chooseProvider(
-  providers: readonly SmsProvider[],
+export function chooseProvider<T extends { id: string; ready(): boolean }>(
+  providers: readonly T[],
   chosen: string | undefined,
   builtIn: readonly string[],
-): SmsProvider | null {
-  if (chosen && chosen !== 'auto') {
-    const named = providers.find((provider) => provider.id === chosen)
-    return named?.ready() ? named : null
-  }
-  const added = providers.filter((provider) => !builtIn.includes(provider.id))
-  const own = providers.filter((provider) => builtIn.includes(provider.id))
-  return [...added, ...own].find((provider) => provider.ready()) ?? null
+): T | null {
+  const candidates =
+    chosen === PLUGIN_PROVIDER
+      ? providers.filter((provider) => !builtIn.includes(provider.id))
+      : providers.filter((provider) => provider.id === chosen)
+  return candidates.find((provider) => provider.ready()) ?? null
 }

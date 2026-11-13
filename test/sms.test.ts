@@ -8,7 +8,15 @@ import {
   smsChannel,
   type SmsProvider,
 } from '../src/channels'
-import { httpProvider, isHttpUrl, twilioProvider } from '../src/sms'
+import {
+  encoderFor,
+  fill,
+  headersProblem,
+  httpProblem,
+  httpProvider,
+  isHttpUrl,
+  twilioProvider,
+} from '../src/sms'
 import { bootOtp } from './fixtures'
 
 /** A `fetch` that answers as told, and keeps what it was asked. */
@@ -100,43 +108,180 @@ describe('Twilio', () => {
 })
 
 describe('an HTTP request', () => {
-  it('posts the number and the text as JSON, with the token when there is one', async () => {
+  const URL = 'https://sms.example.com/send'
+
+  it('by default posts the number and the text as JSON, with the token when there is one', async () => {
     const { fetcher, calls } = fakeFetch(200, 'ok')
-    const http = httpProvider(
-      () => ({ url: 'https://sms.example.com/send', token: 'abc' }),
-      fetcher,
-    )
+    const http = httpProvider(() => ({ url: URL, token: 'abc' }), fetcher)
     expect(http.ready()).toBe(true)
     await http.send(MESSAGE)
-    expect(calls[0]!.url).toBe('https://sms.example.com/send')
+    expect(calls[0]!.url).toBe(URL)
     expect(calls[0]!.init.method).toBe('POST')
     expect(calls[0]!.init.headers).toEqual({
-      'content-type': 'application/json',
       authorization: 'Bearer abc',
+      'content-type': 'application/json',
     })
     expect(JSON.parse(calls[0]!.init.body as string)).toEqual(MESSAGE)
 
     const bare = fakeFetch(204, '')
-    await httpProvider(() => ({ url: 'https://sms.example.com/send' }), bare.fetcher).send(MESSAGE)
+    await httpProvider(() => ({ url: URL }), bare.fetcher).send(MESSAGE)
     expect(bare.calls[0]!.init.headers).toEqual({ 'content-type': 'application/json' })
+    // Authorization set to none sends no token, even when one is in the environment.
+    const none = fakeFetch()
+    await httpProvider(() => ({ url: URL, auth: 'none', token: 'abc' }), none.fetcher).send(MESSAGE)
+    expect(none.calls[0]!.init.headers).toEqual({ 'content-type': 'application/json' })
   })
 
-  it('needs an http or https address', async () => {
-    expect(isHttpUrl('https://sms.example.com/send')).toBe(true)
+  it('sends custom headers, reading the ones marked env: from the environment', async () => {
+    const { fetcher, calls } = fakeFetch()
+    const http = httpProvider(
+      () => ({
+        url: URL,
+        auth: 'headers',
+        // Not sent: the headers are what signs this request in.
+        token: 'abc',
+        headers: [
+          { name: 'X-Api-Key', value: 'env:SMS_API_KEY' },
+          { name: 'X-Sender', value: 'My Site' },
+        ],
+        env: { SMS_API_KEY: 'from-the-environment' },
+      }),
+      fetcher,
+    )
+    expect(http.ready()).toBe(true)
+    await http.send(MESSAGE)
+    expect(calls[0]!.init.headers).toEqual({
+      'X-Api-Key': 'from-the-environment',
+      'X-Sender': 'My Site',
+      'content-type': 'application/json',
+    })
+  })
+
+  it('isn’t ready while an env: header’s variable is missing, and names the variable, not a value', async () => {
+    const http = httpProvider(() => ({
+      url: URL,
+      auth: 'headers',
+      headers: [{ name: 'X-Api-Key', value: 'env:SMS_API_KEY' }],
+      env: {},
+    }))
+    expect(http.ready()).toBe(false)
+    await expect(http.send(MESSAGE)).rejects.toThrow(
+      'The header X-Api-Key reads SMS_API_KEY, which isn’t set',
+    )
+    expect(httpProblem({ url: URL, auth: 'headers', headers: [], env: {} })).toBeNull()
+  })
+
+  it('refuses headers that aren’t headers, or that would change where the request goes', () => {
+    const problem = (name: string, value = 'x') => headersProblem([{ name, value }])
+    expect(problem('X-Api-Key')).toBeNull()
+    expect(problem('Authorization', 'Basic abc=')).toBeNull()
+    expect(problem('X Api Key')).toBe('"X Api Key" isn’t a header name')
+    expect(problem('X-Key:')).toBe('"X-Key:" isn’t a header name')
+    expect(problem('Host')).toBe('Host is set by the request itself')
+    expect(problem('content-length')).toBe('content-length is set by the request itself')
+    // A line break in a value would start a header of the attacker's own.
+    expect(problem('X-Key', 'abc\r\nX-Injected: 1')).toBe('The value of X-Key must be one line')
+    expect(problem('X-Key', 'env:not a name')).toContain('after "env:" comes')
+    expect(problem('X-Key', 'env:lower_case')).toContain('after "env:" comes')
+  })
+
+  it('sends a form, when the service takes one', async () => {
+    const { fetcher, calls } = fakeFetch()
+    await httpProvider(() => ({ url: URL, body: 'form' }), fetcher).send(MESSAGE)
+    expect((calls[0]!.init.headers as Record<string, string>)['content-type']).toBe(
+      'application/x-www-form-urlencoded',
+    )
+    expect(calls[0]!.init.body).toBe('to=%2B393331234567&text=123456+is+your+Shop+code.')
+  })
+
+  it('sends a template of your own, with the number and the message escaped for its type', async () => {
+    const text = 'Say "hi" & <go>\nnow'
+    const send = async (template: string, contentType?: string) => {
+      const { fetcher, calls } = fakeFetch()
+      await httpProvider(
+        () => ({ url: URL, body: 'template', template, contentType }),
+        fetcher,
+      ).send({ to: '+393331234567', text })
+      return calls[0]!.init
+    }
+    const json = await send('{ "recipients": ["{{to}}"], "message": { "body": "{{ text }}" } }')
+    expect((json.headers as Record<string, string>)['content-type']).toBe('application/json')
+    // Still JSON, whatever the message holds.
+    expect(JSON.parse(json.body as string)).toEqual({
+      recipients: ['+393331234567'],
+      message: { body: text },
+    })
+
+    const form = await send('To={{to}}&Body={{text}}', 'application/x-www-form-urlencoded')
+    expect(Object.fromEntries(new URLSearchParams(form.body as string))).toEqual({
+      To: '+393331234567',
+      Body: text,
+    })
+
+    const xml = await send('<sms to="{{to}}">{{text}}</sms>', 'text/xml; charset=utf-8')
+    expect(xml.body).toBe('<sms to="+393331234567">Say &quot;hi&quot; &amp; &lt;go&gt;\nnow</sms>')
+    expect((xml.headers as Record<string, string>)['content-type']).toBe('text/xml; charset=utf-8')
+  })
+
+  it('sends a GET with the number and the message in the address, and no body', async () => {
+    const { fetcher, calls } = fakeFetch()
+    await httpProvider(
+      () => ({
+        url: 'https://sms.example.com/send?to={{to}}&msg={{text}}&from=Shop',
+        method: 'GET',
+        body: 'template',
+      }),
+      fetcher,
+    ).send({ to: '+393331234567', text: 'a & b' })
+    expect(calls[0]!.url).toBe(
+      'https://sms.example.com/send?to=%2B393331234567&msg=a%20%26%20b&from=Shop',
+    )
+    expect(calls[0]!.init.method).toBe('GET')
+    expect(calls[0]!.init.body).toBeUndefined()
+    expect(calls[0]!.init.headers).toEqual({})
+  })
+
+  it('lets a custom Content-Type header have the last word', async () => {
+    const { fetcher, calls } = fakeFetch()
+    await httpProvider(
+      () => ({
+        url: URL,
+        auth: 'headers',
+        headers: [{ name: 'Content-Type', value: 'application/vnd.sms+json' }],
+      }),
+      fetcher,
+    ).send(MESSAGE)
+    expect(calls[0]!.init.headers).toEqual({ 'Content-Type': 'application/vnd.sms+json' })
+  })
+
+  it('needs an http or https address, and a template when one is chosen', async () => {
+    expect(isHttpUrl(URL)).toBe(true)
     expect(isHttpUrl('http://127.0.0.1:3496/sms')).toBe(true)
     for (const bad of ['', 'sms.example.com', 'ftp://example.com', 'javascript:alert(1)']) {
       expect(isHttpUrl(bad)).toBe(false)
       const http = httpProvider(() => ({ url: bad }))
       expect(http.ready()).toBe(false)
-      await expect(http.send(MESSAGE)).rejects.toThrow('URL is not set')
+      await expect(http.send(MESSAGE)).rejects.toThrow('The request’s URL is not set')
     }
+    expect(httpProblem({ url: URL, body: 'template', template: '  ' })).toBe(
+      'The request’s body template is empty',
+    )
   })
 
   it('reports an answer that isn’t a 2xx', async () => {
     const { fetcher } = fakeFetch(401, { message: 'bad token' })
-    await expect(
-      httpProvider(() => ({ url: 'https://sms.example.com/send' }), fetcher).send(MESSAGE),
-    ).rejects.toThrow('The SMS endpoint answered 401: bad token')
+    await expect(httpProvider(() => ({ url: URL }), fetcher).send(MESSAGE)).rejects.toThrow(
+      'The SMS endpoint answered 401: bad token',
+    )
+  })
+
+  it('escapes by content type, and leaves other text as it is', () => {
+    expect(encoderFor('application/json')('a"b\\c')).toBe('a\\"b\\\\c')
+    expect(encoderFor('application/x-www-form-urlencoded')('a b&c')).toBe('a%20b%26c')
+    expect(encoderFor('text/plain')('a<b')).toBe('a<b')
+    expect(
+      fill('{{to}} {{ text }} {{other}}', { to: '1', text: '2' }, (value) => `[${value}]`),
+    ).toBe('[1] [2] {{other}}')
   })
 })
 
@@ -149,21 +294,23 @@ describe('choosing a provider', () => {
   })
   const builtIn = ['twilio', 'http']
 
-  it('on automatic, prefers one a plugin added, then Twilio, then the HTTP request', () => {
-    const all = [provider('twilio', true), provider('http', true), provider('carrier', true)]
-    expect(chooseProvider(all, 'auto', builtIn)?.id).toBe('carrier')
-    expect(chooseProvider(all, undefined, builtIn)?.id).toBe('carrier')
-    expect(chooseProvider(all.slice(0, 2), 'auto', builtIn)?.id).toBe('twilio')
-    const notReady = [provider('twilio', false), provider('http', true), provider('carrier', false)]
-    expect(chooseProvider(notReady, 'auto', builtIn)?.id).toBe('http')
-    expect(chooseProvider([provider('twilio', false)], 'auto', builtIn)).toBeNull()
-  })
-
   it('uses the one Settings names, or none while that one isn’t ready', () => {
     const all = [provider('twilio', true), provider('http', false), provider('carrier', true)]
     expect(chooseProvider(all, 'twilio', builtIn)?.id).toBe('twilio')
     expect(chooseProvider(all, 'http', builtIn)).toBeNull()
     expect(chooseProvider(all, 'gone', builtIn)).toBeNull()
+    expect(chooseProvider(all, undefined, builtIn)).toBeNull()
+  })
+
+  it('for “another plugin’s”, uses the first ready one that isn’t the plugin’s own', () => {
+    const all = [
+      provider('twilio', true),
+      provider('http', true),
+      provider('asleep', false),
+      provider('carrier', true),
+    ]
+    expect(chooseProvider(all, 'plugin', builtIn)?.id).toBe('carrier')
+    expect(chooseProvider(all.slice(0, 3), 'plugin', builtIn)).toBeNull()
   })
 })
 
@@ -236,37 +383,83 @@ describe('on a site', () => {
       })
       expect(site.otp.channels()[1]).toMatchObject({ id: 'sms', ready: true })
       const ada = await site.person('ada@cms.test')
-      const tested = await site.act(ada.cookie, 'test-sms', { to: '+39 333 123 4567' })
+      const tested = await site.act(ada.cookie, 'test-message', {
+        channel: 'sms',
+        to: '+39 333 123 4567',
+      })
       expect(tested.flash).toEqual({
         kind: 'notice',
-        message: 'Twilio accepted a test message for +393331234567.',
+        message: 'A Text message test was accepted for +393331234567.',
       })
       expect(calls[0]!.url).toContain('/Accounts/AC123/Messages.json')
       expect(calls[0]!.body).toMatchObject({ To: '+393331234567', From: '+14155552671' })
-      expect(calls[0]!.body.Body).toMatch(/^Test: 123456 is your Shop code/)
+      expect(calls[0]!.body.Body).toBe('123456 is your Shop code. It works for 10 minutes.')
     } finally {
       vi.unstubAllGlobals()
     }
   })
 
   it('the test message says why it failed, and needs a provider and a number', async () => {
-    const none = await bootOtp()
+    const none = await bootOtp({ settings: { 'otp.method_sms': true } })
     const ada = await none.person('ada@cms.test')
-    expect((await none.act(ada.cookie, 'test-sms', { to: '+393331234567' })).flash?.message).toBe(
-      'No SMS provider is set up. Add one in Settings.',
+    const send = (site: typeof none, cookie: string, to: string, channel = 'sms') =>
+      site.act(cookie, 'test-message', { channel, to })
+    expect((await send(none, ada.cookie, '+393331234567')).flash?.message).toBe(
+      'Text message has no provider that is fully set up. Finish it in Settings.',
     )
-    expect((await none.act(ada.cookie, 'test-sms', { to: '333' })).flash?.kind).toBe('error')
+    expect((await send(none, ada.cookie, '333')).flash?.kind).toBe('error')
+    // A way that is off, or that isn't one, sends nothing.
+    expect((await send(none, ada.cookie, '+393331234567', 'whatsapp')).flash?.message).toBe(
+      'That way isn’t turned on.',
+    )
+    expect((await send(none, ada.cookie, '+393331234567', 'email')).flash?.message).toBe(
+      'That way isn’t turned on.',
+    )
 
     const site = await bootOtp({ sms: true })
     const admin = await site.person('ada@cms.test')
     site.failing.sms = true
-    const failed = await site.act(admin.cookie, 'test-sms', { to: '+393331234567' })
-    expect(failed.flash).toEqual({
+    expect((await send(site, admin.cookie, '+393331234567')).flash).toEqual({
       kind: 'error',
-      message: 'Carrier couldn’t send it: the carrier is down',
+      message: 'The Text message test couldn’t be sent: the carrier is down',
     })
     // Only those who manage OTP may send one.
     const editor = await site.person('ed@cms.test', 'editor')
-    expect((await site.act(editor.cookie, 'test-sms', { to: '+393331234567' })).status).toBe(403)
+    expect((await send(site, editor.cookie, '+393331234567')).status).toBe(403)
+  })
+
+  it('texts go through a custom request once that is what Settings chooses', async () => {
+    const calls: { url: string; init: RequestInit }[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit) => {
+        calls.push({ url, init })
+        return new Response('{}', { status: 200 })
+      }),
+    )
+    try {
+      const site = await bootOtp({
+        settings: {
+          'otp.method_sms': true,
+          'otp.sms_provider': 'http',
+          'otp.sms_http_url': 'https://sms.example.com/v1/messages',
+          'otp.sms_http_auth': 'headers',
+          'otp.sms_http_headers': [{ name: 'X-Api-Key', value: 'env:MY_SMS_KEY' }],
+          'otp.sms_http_body': 'template',
+          'otp.sms_http_template': '{"dst":"{{to}}","text":"{{text}}"}',
+        },
+        env: { MY_SMS_KEY: 'k-123' },
+      })
+      expect(site.otp.channels()[1]).toMatchObject({ id: 'sms', ready: true })
+      const ada = await site.person('ada@cms.test')
+      await site.act(ada.cookie, 'start-channel', { channel: 'sms', to: '+393331234567' })
+      expect(calls[0]!.url).toBe('https://sms.example.com/v1/messages')
+      expect(calls[0]!.init.headers).toMatchObject({ 'X-Api-Key': 'k-123' })
+      const body = JSON.parse(calls[0]!.init.body as string) as { dst: string; text: string }
+      expect(body.dst).toBe('+393331234567')
+      expect(body.text).toMatch(/^\d{6} is your Shop code/)
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })

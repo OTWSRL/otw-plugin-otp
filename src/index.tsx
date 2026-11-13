@@ -3,6 +3,7 @@ import {
   definePlugin,
   type AdminIcon,
   type SelectSetting,
+  type SettingPair,
   type User,
 } from '@otwdesign/sdk'
 import { sql } from 'drizzle-orm'
@@ -10,8 +11,10 @@ import {
   chooseProvider,
   emailChannel,
   smsChannel,
+  whatsAppChannel,
   type OtpChannel,
   type SmsProvider,
+  type WhatsAppProvider,
 } from './channels'
 import {
   APP,
@@ -26,9 +29,10 @@ import {
 import { migrations, TABLES } from './migrations'
 import { createKeys, KEY_ENV, keyProblem } from './secrets'
 import { TwoStepSection } from './section'
-import { httpProvider, isHttpUrl, twilioProvider } from './sms'
+import { headersProblem, httpProvider, isHttpUrl, twilioProvider, type TwilioAccount } from './sms'
+import { metaWhatsAppProvider, twilioWhatsAppProvider } from './whatsapp'
 
-export type { OtpChannel, OtpMessage, SmsProvider } from './channels'
+export type { OtpChannel, OtpMessage, SmsProvider, WhatsAppProvider } from './channels'
 export type { SentCode } from './engine'
 
 /** A purpose forms on the site may ask for codes for, declared with `otp.purpose()`. */
@@ -65,8 +69,8 @@ export interface OtpService {
 
 declare module '@otwdesign/sdk' {
   interface Settings {
-    /** Role ids whose people must use a code, separated by commas. */
-    'otp.required_roles': string
+    /** The roles whose people must use a code. */
+    'otp.required_roles': readonly string[]
     /** Days a browser can ask not to be asked again; `0` doesn't offer it. */
     'otp.remember_days': string
     /** Whether people may use an authenticator app. */
@@ -75,11 +79,13 @@ declare module '@otwdesign/sdk' {
     'otp.method_email': boolean
     /** Whether people may get codes by text message. */
     'otp.method_sms': boolean
+    /** Whether people may get codes over WhatsApp. */
+    'otp.method_whatsapp': boolean
     /** Minutes a sent code works for. */
     'otp.code_minutes': string
     /** Codes the site's forms and setups may send in an hour, per channel. */
     'otp.hourly_limit': string
-    /** Which SMS provider sends text messages: `auto`, `twilio`, `http`. */
+    /** Which SMS provider sends text messages: `twilio`, `http`, or `plugin`. */
     'otp.sms_provider': string
     /** Twilio's Account SID. `TWILIO_ACCOUNT_SID` overrides it. */
     'otp.twilio_account_sid': string
@@ -91,10 +97,36 @@ declare module '@otwdesign/sdk' {
     'otp.twilio_api_secret': string
     /** The Twilio number, sender name or Messaging Service SID texts come from. */
     'otp.twilio_from': string
-    /** The address the HTTP provider posts each text message to. */
+    /** The address the HTTP provider sends each text message to. */
     'otp.sms_http_url': string
+    /** The request's method: `POST` or `GET`. */
+    'otp.sms_http_method': string
+    /** How the request signs in: `bearer`, `headers` or `none`. */
+    'otp.sms_http_auth': string
     /** The bearer token sent with it, from `OTP_SMS_TOKEN` only. */
     'otp.sms_http_token': string
+    /** The request's own headers; a value `env:NAME` is read from the environment. */
+    'otp.sms_http_headers': readonly SettingPair[]
+    /** What the request's body is: `json`, `form` or `template`. */
+    'otp.sms_http_body': string
+    /** The body's template, with `{{to}}` and `{{text}}`. */
+    'otp.sms_http_template': string
+    /** The template's content type. */
+    'otp.sms_http_content_type': string
+    /** Which WhatsApp provider sends codes: `meta`, `twilio`, or `plugin`. */
+    'otp.whatsapp_provider': string
+    /** The WhatsApp Business phone number's ID, for the Cloud API. */
+    'otp.whatsapp_phone_id': string
+    /** The Cloud API's access token, from `WHATSAPP_TOKEN` only. */
+    'otp.whatsapp_token': string
+    /** The approved authentication template's name. */
+    'otp.whatsapp_template': string
+    /** That template's language, such as `en_US`. */
+    'otp.whatsapp_language': string
+    /** The WhatsApp sender codes come from, through Twilio. */
+    'otp.twilio_whatsapp_from': string
+    /** The approved Twilio content template's SID, `HX…`. */
+    'otp.twilio_whatsapp_template': string
   }
   interface Services {
     /** One-time codes for any form, and what a person's two-step sign-in is set to. */
@@ -105,6 +137,8 @@ declare module '@otwdesign/sdk' {
     'otp.channels': OtpChannel
     /** The services that deliver a text message: `twilio` and `http`, and what other plugins add. */
     'otp.sms': SmsProvider
+    /** The services that deliver a code over WhatsApp: `meta` and `twilio`, and what other plugins add. */
+    'otp.whatsapp': WhatsAppProvider
   }
   interface Capabilities {
     /** See OTP's status, change its settings, and send a test message. */
@@ -119,18 +153,14 @@ declare module '@otwdesign/sdk' {
 }
 
 const DAY_SECONDS = 24 * 60 * 60
-const ROLE = /^[a-z0-9_-]+$/
-const BUILT_IN_PROVIDERS = ['twilio', 'http']
+const SMS_PROVIDERS = ['twilio', 'http']
+const WHATSAPP_PROVIDERS = ['meta', 'twilio']
 
-/** The role ids in Settings' list, whatever separates them. */
-export function parseRoles(value: string | undefined): Set<string> {
-  return new Set(
-    (value ?? '')
-      .toLowerCase()
-      .split(/[\s,]+/)
-      .filter(Boolean),
-  )
-}
+// When each provider's own fields show: once it is the one chosen.
+const smsVia = (provider: string) => ({ setting: 'otp.sms_provider', is: provider }) as const
+const whatsAppVia = (provider: string) =>
+  ({ setting: 'otp.whatsapp_provider', is: provider }) as const
+const HTTP = smsVia('http')
 
 const choice = (
   label: string,
@@ -191,6 +221,8 @@ export interface Internals {
   policy(): Policy
   /** The SMS provider text messages go through now, or `null`. */
   smsProvider(): SmsProvider | null
+  /** The WhatsApp provider codes go through now, or `null`. */
+  whatsAppProvider(): WhatsAppProvider | null
   /** Whether app secrets are encrypted, and why a key that is set can't be used. */
   key: { encrypted: boolean; problem: string | null }
 }
@@ -211,20 +243,15 @@ export default definePlugin({
   description:
     'Two-step sign-in with an authenticator app, email or text message, and one-time codes for any form.',
   icon: ICON,
-  requires: { core: '^1.7.0' },
+  requires: { core: '^1.8.0' },
   migrations,
   settings: {
     'otp.required_roles': {
-      type: 'text',
+      type: 'roles',
       label: 'Roles that must use a code',
       description:
-        'Role ids separated by commas, such as administrator, editor. Until someone with one of these roles sets up a way of their own, their codes go to their email address. Empty leaves it to each person.',
-      default: '',
-      maxLength: 500,
-      validate: (value) =>
-        [...parseRoles(value)].every((role) => ROLE.test(role))
-          ? null
-          : 'Use role ids, such as administrator, separated by commas',
+        'Until someone with one of these roles sets up a way of their own, their codes go to their email address. None ticked leaves it to each person.',
+      default: [],
     },
     'otp.remember_days': choice(
       'Remember a browser',
@@ -252,8 +279,14 @@ export default definePlugin({
     'otp.method_sms': {
       type: 'boolean',
       label: 'Text message',
+      description: 'Codes sent to a phone number the person confirms. Its settings show below.',
+      default: false,
+    },
+    'otp.method_whatsapp': {
+      type: 'boolean',
+      label: 'WhatsApp',
       description:
-        'Codes sent to a phone number the person confirms. Needs an SMS provider, below.',
+        'Codes sent over WhatsApp to a number the person confirms. Its settings show below.',
       default: false,
     },
     'otp.code_minutes': choice(
@@ -270,47 +303,23 @@ export default definePlugin({
       type: 'text',
       label: 'Codes forms may send an hour',
       description:
-        'The most codes the site’s forms, and people setting up a way, are sent in an hour, by email and by text message each: a ceiling on what a flood of requests can cost. Signing in doesn’t count.',
+        'The most codes the site’s forms, and people setting up a way, are sent in an hour, by each channel: a ceiling on what a flood of requests can cost. Signing in doesn’t count.',
       default: '100',
       maxLength: 6,
       validate: (value) => (/^\d+$/.test(value) ? null : 'Use a whole number'),
     },
+
+    // ── Text messages ──────────────────────────────────────────────────────────
     'otp.sms_provider': choice(
       'Send text messages through',
-      'Automatic uses a provider another plugin added, then Twilio, then the HTTP request: the first that is set up.',
-      'auto',
+      'Each provider’s own settings show once it’s chosen.',
+      'twilio',
       [
-        ['auto', 'Automatic'],
         ['twilio', 'Twilio'],
-        ['http', 'An HTTP request'],
+        ['http', 'An HTTP request, to any SMS service'],
+        ['plugin', 'A provider another plugin adds'],
       ],
     ),
-    'otp.twilio_account_sid': {
-      type: 'text',
-      label: 'Twilio Account SID',
-      description: 'Starts with AC. From the Twilio Console.',
-      env: 'TWILIO_ACCOUNT_SID',
-      maxLength: 64,
-    },
-    'otp.twilio_auth_token': {
-      type: 'secret',
-      label: 'Twilio Auth Token',
-      description: 'From the Twilio Console. Not needed with an API key.',
-      env: 'TWILIO_AUTH_TOKEN',
-    },
-    'otp.twilio_api_key': {
-      type: 'text',
-      label: 'Twilio API key SID',
-      description:
-        'Starts with SK. Optional: a key of its own, which can be revoked, instead of the Auth Token.',
-      env: 'TWILIO_API_KEY',
-      maxLength: 64,
-    },
-    'otp.twilio_api_secret': {
-      type: 'secret',
-      label: 'Twilio API key secret',
-      env: 'TWILIO_API_SECRET',
-    },
     'otp.twilio_from': {
       type: 'text',
       label: 'Twilio sender',
@@ -318,22 +327,179 @@ export default definePlugin({
         'A Twilio phone number with its country code (+14155552671), a sender name, or a Messaging Service SID (MG…).',
       env: 'TWILIO_FROM',
       maxLength: 64,
+      showWhen: smsVia('twilio'),
     },
     'otp.sms_http_url': {
       type: 'text',
-      label: 'HTTP request URL',
+      label: 'Request URL',
       description:
-        'For any other SMS service: each message is POSTed here as JSON, { "to": "+393331234567", "text": "…" }. Any 2xx answer counts as sent.',
+        'Your SMS service’s endpoint. For one that takes everything in the address, write {{to}} and {{text}} where the number and the message go.',
       env: 'OTP_SMS_URL',
-      maxLength: 500,
+      maxLength: 1000,
       validate: (value) =>
         value === '' || isHttpUrl(value) ? null : 'Use an http or https address',
+      showWhen: HTTP,
+    },
+    'otp.sms_http_method': {
+      ...choice(
+        'Method',
+        'A GET sends no body: the number and the message go in the URL.',
+        'POST',
+        [
+          ['POST', 'POST'],
+          ['GET', 'GET'],
+        ],
+      ),
+      showWhen: HTTP,
+    },
+    'otp.sms_http_auth': {
+      ...choice('Authorization', 'How the request proves it is yours.', 'bearer', [
+        ['bearer', 'A bearer token'],
+        ['headers', 'Custom headers'],
+        ['none', 'None'],
+      ]),
+      showWhen: HTTP,
     },
     'otp.sms_http_token': {
       type: 'secret',
-      label: 'HTTP request token',
+      label: 'Bearer token',
       description: 'Sent as “Authorization: Bearer …”.',
       env: 'OTP_SMS_TOKEN',
+      showWhen: [HTTP, { setting: 'otp.sms_http_auth', is: 'bearer' }],
+    },
+    'otp.sms_http_headers': {
+      type: 'pairs',
+      label: 'Headers',
+      nameLabel: 'Header',
+      description:
+        'Sent with every request. For a key, write env:NAME as the value, such as env:SMS_API_KEY, and it is read from the server’s environment; a value typed here is stored in the database and shown to whoever manages OTP.',
+      maxRows: 20,
+      validate: headersProblem,
+      showWhen: [HTTP, { setting: 'otp.sms_http_auth', is: 'headers' }],
+    },
+    'otp.sms_http_body': {
+      ...choice('Body', 'What a POST sends.', 'json', [
+        ['json', 'JSON: { "to": "+393331234567", "text": "…" }'],
+        ['form', 'A form: to=…&text=…'],
+        ['template', 'Your own template'],
+      ]),
+      showWhen: HTTP,
+    },
+    'otp.sms_http_template': {
+      type: 'text',
+      label: 'Body template',
+      description:
+        'Write {{to}} where the number goes and {{text}} where the message goes. Both are escaped for the content type below, so a message can’t break the body.',
+      multiline: true,
+      maxLength: 4000,
+      showWhen: [HTTP, { setting: 'otp.sms_http_body', is: 'template' }],
+    },
+    'otp.sms_http_content_type': {
+      type: 'text',
+      label: 'Content type',
+      description:
+        'Of the template: application/json, application/x-www-form-urlencoded, text/xml.',
+      default: 'application/json',
+      maxLength: 100,
+      validate: (value) =>
+        /^[\w.+-]+\/[\w.+-]+(;.*)?$/.test(value)
+          ? null
+          : 'Use a media type, such as application/json',
+      showWhen: [HTTP, { setting: 'otp.sms_http_body', is: 'template' }],
+    },
+
+    // ── WhatsApp ───────────────────────────────────────────────────────────────
+    'otp.whatsapp_provider': choice(
+      'Send WhatsApp codes through',
+      'WhatsApp sends a business’s approved message template: make one of the “authentication” kind with your provider first.',
+      'meta',
+      [
+        ['meta', 'WhatsApp Cloud API (Meta)'],
+        ['twilio', 'Twilio'],
+        ['plugin', 'A provider another plugin adds'],
+      ],
+    ),
+    'otp.whatsapp_phone_id': {
+      type: 'text',
+      label: 'Phone number ID',
+      description:
+        'Of your WhatsApp Business number, from Meta’s dashboard: digits, not the number itself.',
+      env: 'WHATSAPP_PHONE_ID',
+      maxLength: 32,
+      validate: (value) => (/^\d+$/.test(value) ? null : 'Use the ID’s digits'),
+      showWhen: whatsAppVia('meta'),
+    },
+    'otp.whatsapp_token': {
+      type: 'secret',
+      label: 'Access token',
+      description: 'A system user’s token with the whatsapp_business_messaging permission.',
+      env: 'WHATSAPP_TOKEN',
+      showWhen: whatsAppVia('meta'),
+    },
+    'otp.whatsapp_template': {
+      type: 'text',
+      label: 'Template name',
+      description: 'The approved authentication template, with a “Copy code” button.',
+      maxLength: 512,
+      validate: (value) =>
+        /^[a-z0-9_]+$/.test(value) ? null : 'Use the template’s name, such as sign_in_code',
+      showWhen: whatsAppVia('meta'),
+    },
+    'otp.whatsapp_language': {
+      type: 'text',
+      label: 'Template language',
+      default: 'en_US',
+      maxLength: 10,
+      validate: (value) =>
+        /^[a-z]{2,3}(_[A-Z]{2})?$/.test(value) ? null : 'Use a code such as en_US',
+      showWhen: whatsAppVia('meta'),
+    },
+    'otp.twilio_whatsapp_from': {
+      type: 'text',
+      label: 'WhatsApp sender',
+      description:
+        'Your WhatsApp number at Twilio, with its country code, or a Messaging Service SID (MG…).',
+      env: 'TWILIO_WHATSAPP_FROM',
+      maxLength: 64,
+      showWhen: whatsAppVia('twilio'),
+    },
+    'otp.twilio_whatsapp_template': {
+      type: 'text',
+      label: 'Content template SID',
+      description:
+        'Starts with HX. The approved authentication template, whose variable {{1}} is the code.',
+      maxLength: 64,
+      validate: (value) =>
+        /^HX[0-9a-fA-F]{32}$/.test(value) ? null : 'Use the template’s SID, which starts with HX',
+      showWhen: whatsAppVia('twilio'),
+    },
+
+    // ── The Twilio account, for whichever of the two uses it ───────────────────
+    'otp.twilio_account_sid': {
+      type: 'text',
+      label: 'Account SID',
+      description: 'Starts with AC. From the Twilio Console.',
+      env: 'TWILIO_ACCOUNT_SID',
+      maxLength: 64,
+    },
+    'otp.twilio_auth_token': {
+      type: 'secret',
+      label: 'Auth Token',
+      description: 'From the Twilio Console. Not needed with an API key.',
+      env: 'TWILIO_AUTH_TOKEN',
+    },
+    'otp.twilio_api_key': {
+      type: 'text',
+      label: 'API key SID',
+      description:
+        'Starts with SK. Optional: a key of its own, which can be revoked, instead of the Auth Token.',
+      env: 'TWILIO_API_KEY',
+      maxLength: 64,
+    },
+    'otp.twilio_api_secret': {
+      type: 'secret',
+      label: 'API key secret',
+      env: 'TWILIO_API_SECRET',
     },
   },
 
@@ -348,12 +514,13 @@ export default definePlugin({
       [APP]: () => setting('otp.method_app') !== false,
       email: () => setting('otp.method_email') !== false,
       sms: () => setting('otp.method_sms') === true,
+      whatsapp: () => setting('otp.method_whatsapp') === true,
     }
     const policy = (): Policy => ({
       disabled: ['1', 'true'].includes(env.OTP_DISABLED ?? ''),
       // A channel another plugin added is on unless that plugin says otherwise.
       allowed: (method) => allowed[method]?.() ?? true,
-      requiredRoles: parseRoles(setting('otp.required_roles')),
+      requiredRoles: new Set(setting('otp.required_roles') ?? []),
       rememberDays: Number(setting('otp.remember_days') ?? 0) || 0,
       minutes: Number(setting('otp.code_minutes') ?? 10) || 10,
       hourlyLimit: Number(setting('otp.hourly_limit') ?? 100) || 0,
@@ -361,28 +528,61 @@ export default definePlugin({
 
     cms.auth.capability('otp.manage', { label: 'Manage OTP and its settings' })
 
+    const twilioAccount = (): TwilioAccount => ({
+      accountSid: setting('otp.twilio_account_sid'),
+      authToken: setting('otp.twilio_auth_token'),
+      apiKey: setting('otp.twilio_api_key'),
+      apiSecret: setting('otp.twilio_api_secret'),
+      api: env.TWILIO_API_URL,
+    })
+
     const providers = cms.registries.define('otp.sms')
-    providers.add(
-      twilioProvider(() => ({
-        accountSid: setting('otp.twilio_account_sid'),
-        authToken: setting('otp.twilio_auth_token'),
-        apiKey: setting('otp.twilio_api_key'),
-        apiSecret: setting('otp.twilio_api_secret'),
-        from: setting('otp.twilio_from'),
-        api: env.TWILIO_API_URL,
-      })),
-    )
+    providers.add(twilioProvider(() => ({ ...twilioAccount(), from: setting('otp.twilio_from') })))
     providers.add(
       httpProvider(() => ({
         url: setting('otp.sms_http_url'),
+        method: setting('otp.sms_http_method'),
+        auth: setting('otp.sms_http_auth'),
         token: setting('otp.sms_http_token'),
+        headers: setting('otp.sms_http_headers'),
+        body: setting('otp.sms_http_body'),
+        template: setting('otp.sms_http_template'),
+        contentType: setting('otp.sms_http_content_type'),
+        env,
       })),
     )
     const smsProvider = () =>
-      chooseProvider(providers.list(), setting('otp.sms_provider'), BUILT_IN_PROVIDERS)
+      chooseProvider(providers.list(), setting('otp.sms_provider') ?? 'twilio', SMS_PROVIDERS)
+
+    const whatsApp = cms.registries.define('otp.whatsapp')
+    whatsApp.add(
+      metaWhatsAppProvider(() => ({
+        phoneId: setting('otp.whatsapp_phone_id'),
+        token: setting('otp.whatsapp_token'),
+        template: setting('otp.whatsapp_template'),
+        language: setting('otp.whatsapp_language'),
+        api: env.WHATSAPP_API_URL,
+        version: env.WHATSAPP_API_VERSION,
+      })),
+    )
+    whatsApp.add(
+      twilioWhatsAppProvider(() => ({
+        ...twilioAccount(),
+        from: setting('otp.twilio_whatsapp_from'),
+        contentSid: setting('otp.twilio_whatsapp_template'),
+      })),
+    )
+    const whatsAppProvider = () =>
+      chooseProvider(
+        whatsApp.list(),
+        setting('otp.whatsapp_provider') ?? 'meta',
+        WHATSAPP_PROVIDERS,
+      )
+
     const channels = cms.registries.define('otp.channels')
     channels.add(emailChannel(cms.mail))
     channels.add(smsChannel(smsProvider))
+    channels.add(whatsAppChannel(whatsAppProvider))
 
     const site = () => setting('site.title') || 'My Site'
     const keys = createKeys(env[KEY_ENV])
@@ -466,6 +666,7 @@ export default definePlugin({
       engine,
       policy,
       smsProvider,
+      whatsAppProvider,
       key: { encrypted: keys.encrypted, problem: keyProblem(env[KEY_ENV]) },
     })
     cms.services.provide('otp', service)

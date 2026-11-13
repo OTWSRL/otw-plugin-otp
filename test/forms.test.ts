@@ -149,7 +149,7 @@ describe('limits', () => {
 
   it('cap what forms send in an hour, whoever asks, without touching sign-ins', async () => {
     const site = await boot({
-      settings: { 'otp.hourly_limit': '3', 'otp.required_roles': 'administrator' },
+      settings: { 'otp.hourly_limit': '3', 'otp.required_roles': ['administrator'] },
     })
     for (const name of ['a', 'b', 'c']) {
       await site.otp.send({ channel: 'email', to: `${name}@example.com`, purpose: 'contact' })
@@ -207,7 +207,7 @@ describe('limits', () => {
   })
 
   it('never check a code that belongs to a sign-in', async () => {
-    const site = await boot({ settings: { 'otp.required_roles': 'administrator' } })
+    const site = await boot({ settings: { 'otp.required_roles': ['administrator'] } })
     await site.person('ada@cms.test')
     await site.logIn('ada@cms.test')
     const code = emailedCode(site.inbox, 'ada@cms.test')
@@ -227,13 +227,15 @@ describe('the service', () => {
     expect(off.otp.channels()).toEqual([
       { id: 'email', label: 'Email', kind: 'email', ready: false },
       { id: 'sms', label: 'Text message', kind: 'phone', ready: false },
+      { id: 'whatsapp', label: 'WhatsApp', kind: 'phone', ready: false },
     ])
     await expect(
       off.otp.send({ channel: 'email', to: 'vera@example.com', purpose: 'contact' }),
     ).rejects.toThrow('Codes can’t be sent that way on this site.')
 
     const on = await boot({ sms: true })
-    expect(on.otp.channels().map((channel) => channel.ready)).toEqual([true, true])
+    // WhatsApp stays off until Settings turns it on.
+    expect(on.otp.channels().map((channel) => channel.ready)).toEqual([true, true, false])
   })
 
   it('refuses a purpose with a name it can’t use', async () => {
@@ -261,38 +263,38 @@ describe('the service', () => {
 describe('a channel another plugin adds', () => {
   it('can be set up and signed in with, like the plugin’s own', async () => {
     const sent: { to: string; code: string }[] = []
-    const whatsapp = definePlugin({
-      id: 'whatsapp',
+    const voice = definePlugin({
+      id: 'voice',
       version: '1.0.0',
       requires: { otp: '^1.0.0' },
       setup(cms) {
         cms.registries.get('otp.channels').add({
-          id: 'whatsapp',
-          label: 'WhatsApp',
+          id: 'voice',
+          label: 'Voice call',
           kind: 'phone',
           ready: () => true,
           send: async (to, message) => void sent.push({ to, code: message.code }),
         })
       },
     })
-    const site = await bootOtp({ plugins: [whatsapp] })
+    const site = await bootOtp({ plugins: [voice] })
     const ada = await site.person('ada@cms.test')
     const started = await site.act(ada.cookie, 'start-channel', {
-      channel: 'whatsapp',
+      channel: 'voice',
       to: '+393331234567',
     })
     expect(started.flash?.kind).toBe('notice')
     const done = await site.act(ada.cookie, 'confirm-channel', {
-      channel: 'whatsapp',
+      channel: 'voice',
       code: sent.at(-1)!.code,
     })
     expect(done.flash?.message).toBe(
-      'Codes by whatsapp are on: you’ll be sent one when you sign in.',
+      'Codes by voice call are on: you’ll be sent one when you sign in.',
     )
 
     site.wait(61)
     const held = await site.logIn('ada@cms.test')
-    expect(await site.offered(held.hold)).toEqual(['whatsapp', 'backup'])
-    expect((await site.verify(held.hold, 'whatsapp', sent.at(-1)!.code)).session).not.toBeNull()
+    expect(await site.offered(held.hold)).toEqual(['voice', 'backup'])
+    expect((await site.verify(held.hold, 'voice', sent.at(-1)!.code)).session).not.toBeNull()
   })
 })

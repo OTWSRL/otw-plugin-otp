@@ -72,7 +72,8 @@ export async function bootOtp(options: BootOptions = {}) {
     admin: [otpAdmin],
     settings: {
       'site.title': 'Shop',
-      ...(options.sms ? { 'otp.method_sms': true } : {}),
+      // The tests' own provider, which another plugin adds.
+      ...(options.sms ? { 'otp.method_sms': true, 'otp.sms_provider': 'plugin' } : {}),
       ...options.settings,
     },
     env: options.env,

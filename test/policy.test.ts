@@ -1,11 +1,11 @@
 import { TEST_PASSWORD } from '@otwdesign/testing'
 import { describe, expect, it } from 'vitest'
-import otp, { noticeText, parseRoles } from '../src/index'
+import otp, { noticeText } from '../src/index'
 import { totp } from '../src/totp'
 import { bootOtp, emailedCode } from './fixtures'
 
 describe('roles that must use a code', () => {
-  const settings = { 'otp.required_roles': 'Administrator, editor' }
+  const settings = { 'otp.required_roles': ['administrator', 'editor'] }
 
   it('get codes by email until they set up a way of their own', async () => {
     const site = await bootOtp({ settings })
@@ -52,18 +52,8 @@ describe('roles that must use a code', () => {
     ).toBe(true)
   })
 
-  it('reads the setting’s list however it’s separated', () => {
-    expect([...parseRoles(' Administrator,editor  shop_manager ')]).toEqual([
-      'administrator',
-      'editor',
-      'shop_manager',
-    ])
-    expect(parseRoles(undefined).size).toBe(0)
-    const validate = (otp.settings!['otp.required_roles'] as { validate(value: string): unknown })
-      .validate
-    expect(validate('administrator, editor')).toBeNull()
-    expect(validate('')).toBeNull()
-    expect(validate('admin!')).toBe('Use role ids, such as administrator, separated by commas')
+  it('are chosen from the site’s roles, in Settings', () => {
+    expect(otp.settings!['otp.required_roles']).toMatchObject({ type: 'roles', default: [] })
   })
 })
 
@@ -91,7 +81,7 @@ describe('a password set from an emailed link', () => {
   })
 
   it('doesn’t ask for a code by email: the link has just proved the inbox', async () => {
-    const site = await bootOtp({ settings: { 'otp.required_roles': 'administrator' } })
+    const site = await bootOtp({ settings: { 'otp.required_roles': ['administrator'] } })
     await site.person('ada@cms.test')
     const done = await reset(site, 'ada@cms.test')
     expect(done.session).not.toBeNull()
@@ -266,7 +256,7 @@ describe('what people are told', () => {
 
 describe('housekeeping', () => {
   it('clears out old codes, lapsed browsers and setups never finished, daily', async () => {
-    const site = await bootOtp({ settings: { 'otp.required_roles': 'administrator' } })
+    const site = await bootOtp({ settings: { 'otp.required_roles': ['administrator'] } })
     const ada = await site.person('ada@cms.test')
     await site.logIn('ada@cms.test')
     await site.act(ada.cookie, 'start-app')

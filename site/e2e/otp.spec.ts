@@ -109,24 +109,71 @@ test('the first visit sets the site up, and OTP says what it can use', async () 
   await expect(row(admin, 'App secrets')).toContainText('Encrypted with OTP_SECRET_KEY')
 })
 
-test('an administrator turns on text messages and remembered browsers, and tests the provider', async () => {
+test('settings show a provider’s fields only once it’s chosen, and its test goes through it', async () => {
   await admin.goto('/admin/otp/settings')
   await expect(admin.getByRole('heading', { name: 'OTP Settings' })).toBeVisible()
+  // Text messages are off: nothing about them shows.
+  const provider = admin.getByLabel('Send text messages through')
+  await expect(provider).toBeHidden()
+  await expect(admin.getByRole('heading', { name: 'Twilio account' })).toBeHidden()
+
   await admin.getByRole('checkbox', { name: 'Text message' }).check()
+  // Twilio, until another is chosen: its sender and its account, and nothing of the others.
+  await expect(provider).toHaveValue('twilio')
+  await expect(admin.getByLabel('Twilio sender')).toBeVisible()
+  await expect(admin.getByRole('heading', { name: 'Twilio account' })).toBeVisible()
+  await expect(admin.getByLabel('Request URL')).toBeHidden()
+
+  await provider.selectOption('http')
+  await expect(admin.getByLabel('Twilio sender')).toBeHidden()
+  await expect(admin.getByRole('heading', { name: 'Twilio account' })).toBeHidden()
+  // The address and the token come from the server's environment.
+  await expect(admin.getByLabel('Request URL')).toBeDisabled()
+  await expect(admin.getByRole('group', { name: 'Headers' })).toBeHidden()
+  await admin.getByLabel('Authorization').selectOption('headers')
+  await expect(admin.getByRole('group', { name: 'Headers' })).toBeVisible()
+  await admin.getByLabel('Authorization').selectOption('bearer')
+  await expect(admin.getByLabel('Body template')).toBeHidden()
+  await admin.getByLabel('Body', { exact: true }).selectOption('template')
+  await expect(admin.getByLabel('Body template')).toBeVisible()
+  await admin.getByLabel('Body', { exact: true }).selectOption('json')
+
   await admin.getByLabel('Remember a browser').selectOption('30')
-  // The provider's address and token come from the server's environment.
-  await expect(admin.getByLabel('HTTP request URL')).toBeDisabled()
+  await admin.getByRole('button', { name: 'Save Changes' }).click()
+  await notice(admin, 'Settings saved.')
+  // As it was left: the HTTP request's fields, without choosing again.
+  await expect(admin.getByLabel('Request URL')).toBeVisible()
+
+  await admin.getByRole('link', { name: 'Send a Test Message' }).click()
+  await expect(admin).toHaveURL('/admin/otp#test-sms')
+  await expect(row(admin, 'Text message')).toContainText('Ready, through HTTP request')
+  const test = admin.locator('#test-sms')
+  await test.getByLabel('Mobile number').fill('+39 333 999 0000')
+  await test.getByRole('button', { name: 'Send Test by Text message' }).click()
+  await notice(admin, 'A Text message test was accepted for +393339990000.')
+  expect(await text('+393339990000', /^123456 is your/)).toBe(
+    '123456 is your My Site code. It works for 10 minutes.',
+  )
+})
+
+test('WhatsApp codes go through the Cloud API as the approved template', async () => {
+  await admin.goto('/admin/otp/settings')
+  await expect(admin.getByLabel('Send WhatsApp codes through')).toBeHidden()
+  await admin.getByRole('checkbox', { name: 'WhatsApp' }).check()
+  await expect(admin.getByLabel('Send WhatsApp codes through')).toHaveValue('meta')
+  await admin.getByLabel('Phone number ID').fill('106540352242922')
+  await admin.getByLabel('Template name').fill('sign_in_code')
+  await expect(admin.getByLabel('Content template SID')).toBeHidden()
   await admin.getByRole('button', { name: 'Save Changes' }).click()
   await notice(admin, 'Settings saved.')
 
-  await admin.goto('/admin/otp')
-  await expect(row(admin, 'Text message')).toContainText('Ready, through HTTP request')
-  await admin.getByLabel('Mobile number').fill('+39 333 999 0000')
-  await admin.getByRole('button', { name: 'Send Test Message' }).click()
-  await notice(admin, 'HTTP request accepted a test message for +393339990000.')
-  expect(await text('+393339990000', /^Test: /)).toBe(
-    'Test: 123456 is your My Site code. It works for 10 minutes.',
-  )
+  await admin.getByRole('link', { name: 'Send a Test by WhatsApp' }).click()
+  await expect(row(admin, 'WhatsApp')).toContainText('Ready, through WhatsApp Cloud API')
+  const test = admin.locator('#test-whatsapp')
+  await test.getByLabel('Mobile number').fill('+39 333 888 0000')
+  await test.getByRole('button', { name: 'Send Test by WhatsApp' }).click()
+  await notice(admin, 'A WhatsApp test was accepted for +393338880000.')
+  expect(await text('+393338880000', /^whatsapp /)).toBe('whatsapp sign_in_code en_US 123456')
 })
 
 test('they set up an authenticator app on their Profile, and save their backup codes', async () => {
@@ -214,8 +261,10 @@ test('a backup code signs in once, on the site’s account page, where a phone i
 
   const section = page.getByRole('region', { name: 'Two-step sign-in' })
   await expect(section).toContainText('You have 9 of 10 left.')
-  await section.getByLabel('Mobile number').fill('+39 333 123 4567')
-  await section.getByRole('button', { name: 'Send a code', exact: true }).click()
+  // WhatsApp is on too, and asks for a number of its own: this is the text message's form.
+  const sms = section.getByRole('form', { name: 'Set up Text message' })
+  await sms.getByLabel('Mobile number').fill('+39 333 123 4567')
+  await sms.getByRole('button', { name: 'Send a code', exact: true }).click()
   textedAt = Date.now()
   await expect(page.getByRole('status')).toHaveText('We sent a code to the number ending in 67.')
   const code = /^(\d{6}) is your My Site code/.exec(await text(PHONE, /is your My Site code/))![1]!
@@ -253,7 +302,10 @@ test('a role that must use a code gets one by email until its people set up thei
   browser,
 }) => {
   await admin.goto('/admin/otp/settings')
-  await admin.getByLabel('Roles that must use a code').fill('editor')
+  await admin
+    .getByRole('group', { name: 'Roles that must use a code' })
+    .getByLabel('Editor')
+    .check()
   await admin.getByRole('button', { name: 'Save Changes' }).click()
   await notice(admin, 'Settings saved.')
 
